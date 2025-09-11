@@ -1,0 +1,469 @@
+New Thread
+Press Enter to send, Shift + Enter for new line
+Attach
+Your message:
+
+I am reading the attached paper. How does MTP compare to DSPy in terms of the generated prompts? Can you give an example of how the code and outputs might look for each?
+2405.08965v5.pdf
+Attach
+Assistant Reply:
+
+Here’s a concise side-by-side that reflects what the paper reports and demonstrates.
+
+High-level differences in how prompts are produced
+
+    MTP (Meaning-Typed Programming)
+        Prompting is automated. It derives intent and structure from the program’s own semantics (names, types, signatures, object schemas) captured in MT-IR at compile time and bound to runtime values by MT-Runtime.
+        Developers generally do not write prompts. The by operator plus the program’s types/names supply enough signal for the LLM.
+        Output handling is automated to the target return type (with retries if parsing/type conversion fails).
+
+    DSPy
+        You specify a declarative Signature (inputs/outputs), often with Pydantic/BaseModel types and field descriptions to shape the model’s behavior and output.
+        DSPy then composes prompts from those signatures/descriptions (and can optionally “compile” with examples to search for better prompts).
+        You still author structural/type annotations and sometimes descriptions; parsing is helped by those typed schemas but can fail with type mismatches.
+
+Concrete example: “generate next game level” (from the paper)
+Goal: Given previous level(s) of a 2D game, produce the next Level object.
+
+Data model (common to both)
+
+    Classes: Position(x: int, y: int), Wall(start_pos: Position, end_pos: Position), Map(walls: list[Wall], enemies: list[Position], player_pos: Position), Level(level_id: int, difficulty: int, width: int, height: int, num_wall: int, num_enemies: int, map: Map)
+
+MTP version (minimal code; prompt inferred from code semantics)
+
+    Code
+
+python
+
+from mtp.core.llms import OpenAI
+
+llm = OpenAI(model_name="gpt-4o")
+
+def get_next_level(prev_levels: list[Level]) -> Level by llm
+
+new_level = get_next_level(prev_levels)
+
+    What the generated prompt looks like (conceptually)
+        MT-Runtime synthesizes a prompt using:
+            Action: get_next_level
+            Inputs_Information: (prev_levels) typed as list[Level], with runtime values
+            Output_Information: Level
+            Type_Explanations: recursively expanded schemas for Level, Map, Wall, Position, including field names and primitive types
+        Example shape (abridged from the paper’s Figure 9d):
+            [System prompt] This is an operation you must perform and return the output values …
+            [Inputs_Information] (prev_levels) (list[Level]) = <bound values>
+            [Output_Information] (Level)
+            [Type_Explanations] Level(obj): Level(level_id=int, …, map=Map); Map(obj): Map(enemies=list[Position], player_pos=Position, walls=list[Wall]); Position(obj): Position(x=int, y=int); Wall(obj): Wall(start_pos=Position, end_pos=Position)
+            [Action] get_next_level
+            [Output] <result>
+        You do not hand-write this; MT-Runtime builds it from MT-IR plus runtime values.
+
+    What the output looks like
+        The model is instructed to return a Python-constructible object expression, e.g.:
+            Level(level_id=2, difficulty=3, width=66, height=44, num_wall=8, num_enemies=6, map=Map(walls=[Wall(start_pos=Position(x=1,y=2), end_pos=Position(x=1,y=10))], enemies=[Position(x=5,y=5)], player_pos=Position(x=0,y=0)))
+        MT-Runtime uses ast.literal_eval (or equivalent) to construct the actual Level instance; if parsing/type mismatch occurs, it auto-retries with a concise corrective prompt until success or a retry limit, then raises a type error if needed.
+
+DSPy version (explicit schema/Signature; DSPy composes prompts using your annotations)
+
+    Code
+
+python
+
+import dspy
+from pydantic import BaseModel, Field
+
+llm = dspy.OpenAI(model="gpt-4o", max_tokens=1024)
+dspy.settings.configure(lm=llm)
+
+class Position(BaseModel):
+  x: int = Field(description="X Coordinate")
+  y: int = Field(description="Y Coordinate")
+
+class Wall(BaseModel):
+  start_pos: Position = Field(description="Start Position of the Wall")
+  end_pos: Position = Field(description="End Position of the Wall")
+
+class Map(BaseModel):
+  walls: list[Wall] = Field(description="Walls in the Map")
+  enemies: list[Position] = Field(description="Enemies in the Map")
+  player_pos: Position = Field(description="Player Position in the Map")
+
+class Level(BaseModel):
+  level_id: int = Field(description="Level No")
+  difficulty: int = Field(description="Difficulty of the Level")
+  width: int = Field(description="Width of the Map")
+  height: int = Field(description="Height of the Map")
+  num_wall: int = Field(description="Number of Walls in the Map")
+  num_enemies: int = Field(description="Number of Enemies in the Map")
+  map: Map = Field(description="Layout of the Map")
+
+class GetNextLevel(dspy.Signature):
+  """Create Next Level"""
+  prev_levels: list[Level] = dspy.InputField(desc="Last Played Levels")
+  level: Level = dspy.OutputField(desc="Level")
+
+new_level = dspy.TypedPredictor(GetNextLevel)(prev_levels=prev_levels).level
+
+    What the generated prompt looks like (conceptually)
+        DSPy composes a prompt using:
+            The natural-language docstring (“Create Next Level”)
+            Input/output field descriptions
+            The Pydantic schemas (field names/types/descriptions)
+        If you use DSPy “compile” with few-shot examples, it will search over prompt templates and settings to optimize accuracy, but you must supply training examples and accept the extra time/cost.
+
+    What the output looks like
+        Ideally a JSON (or structure) conforming to Level’s Pydantic schema, which DSPy parses into Level.
+        In practice, the paper reports type mismatches can occur (e.g., model replies with a string where an int is expected), causing parsing failures unless carefully mitigated by better signatures, compilation, or guardrails.
+
+Summary of practical differences (per the paper’s findings)
+
+    Developer effort
+        MTP: Add by llm to existing functions/methods/initializers; no manual prompt or schema boilerplate; output conversion/retries handled for you.
+        DSPy: Define Pydantic models with Field descriptions; define a Signature; wire predictors; optional compilation with examples.
+
+    Prompt quality and evolution
+        MTP: Leverages “meaning” in code (names/types/structure) via MT-IR; as LLMs improve, MTP’s accuracy improves notably without extra prompt work.
+        DSPy: Strong structure via signatures/models; “compiled” mode can boost accuracy with examples but adds setup/training time.
+
+    Fail modes
+        MTP: If the model’s text isn’t directly evaluable into the target type, MT-Runtime auto-corrects with concise retries; ultimately raises a type error on persistent mismatch.
+        DSPy: Type mismatches can surface as parsing errors unless mitigated.
+
+    Example outcome in the game-level benchmark
+        Both can produce a correct Level object for the next stage. The paper reports MTP matched or slightly exceeded DSPy accuracy on several models while using fewer tokens and requiring fewer code changes.
+
+If you’d like, I can also mock up a tiny runnable toy for both approaches (e.g., “summarize a Task list into a prioritized Plan”) to show the flavor of the prompts/outputs on a simpler example.
+GPT-5
+51.96 tok/sec
+1663 tokens
+Time-to-First: 3.0 sec
+Your message:
+
+How does MTP generate prompts?
+Assistant Reply:
+
+MTP generates prompts automatically from your code’s own semantics plus the live values at the call site. It does this in two stages: a compile-time MT-IR pass and a runtime MT-Runtime pass.
+
+Here’s the flow end to end:
+
+    You mark an integration point with the by operator
+
+    Example: def get_next_level(prev_levels: list[Level]) -> Level by llm
+    You can also use by on object construction and class methods.
+
+    Compile time: Build MT-IR (Meaning-Typed Intermediate Representation)
+
+    The Jac compiler analyzes your codebase’s AST and symbol tables to extract “meaning”:
+        Function/method names and full signatures (parameter names/types, return type).
+        Class and type definitions, recursively expanded (e.g., Level → Map → Wall → Position).
+        Where a by site appears, it records exactly which symbols and types are relevant.
+    It resolves types across modules (so you don’t need to inline schemas) and stores a compact, semantically rich IR keyed to each by site.
+    This avoids including entire source code and keeps prompts concise.
+
+    Runtime: Synthesize the prompt using MT-IR + live values
+
+    When the by-marked code executes, MT-Runtime:
+        Looks up the MT-IR entry for that call site.
+        Binds actual runtime values for inputs (e.g., the concrete prev_levels list).
+        Fills a general prompt template with:
+            Action: the intended operation inferred from the function/method name (e.g., get_next_level).
+            Inputs_Information: parameter names, types, and their bound values.
+            Output_Information: the expected return type (e.g., Level).
+            Type_Explanations: recursively expanded object schemas with field names and primitive types (e.g., Level(level_id=int, …, map=Map), Map(…), Wall(…), Position(…)).
+    The template is plain, minimal, and structured to aid parsing. An abridged example (from the paper’s Fig. 9d) looks like:
+        [System] This is an operation you must perform and return the output values …
+        [Inputs_Information] (prev_levels) (list[Level]) = <bound values>
+        [Output_Information] (Level)
+        [Type_Explanations] Level(obj): Level(level_id=int, …, map=Map) … Map … Wall … Position …
+        [Action] get_next_level
+        [Output] <result>
+    Because the prompt contains the expected output type and schema, the model is steered to emit a directly constructible object expression (e.g., Level(…)) or equivalent structured text.
+
+    Output conversion and auto-correction
+
+    MT-Runtime parses the LLM’s textual output into the target return type (e.g., using Python-safe evaluation for object expressions).
+    If parsing or typing fails, MT-Runtime issues a short corrective retry prompt that:
+        Echoes the bad output,
+        Reminds the expected target type/schema,
+        Requests a corrected response.
+    It retries up to a limit, then raises a type error if still incompatible.
+
+Why this works
+
+    The “meaning” in your code (names, types, signatures, object schemas) provides the LLM with enough intent and structure without hand-written prompts.
+    MT-IR ensures only relevant, compact semantics are included, controlling token use.
+    As LLMs improve at understanding code-like structure, MTP’s automatically synthesized prompts tend to perform as well as, or better than, hand-crafted prompts, with less developer effort.
+
+Quick concrete example
+
+    Code:
+        def calculate_age(cur_year: int, dob: str) -> int by llm
+    MT-IR records:
+        Function name: calculate_age
+        Params: cur_year: int, dob: str
+        Return: int
+    Runtime prompt (conceptual):
+        [Inputs_Information] (cur_year)(int)=2024; (dob)(str)="March 14, 1879"
+        [Output_Information] (int)
+        [Action] calculate_age
+        [Output] <result>
+    Expected model output: 145
+    MT-Runtime ensures the output parses as an int; if it gets “Age: 145 years”, it will prompt a concise correction to return just an integer.
+
+GPT-5
+43.29 tok/sec
+923 tokens
+Time-to-First: 2.3 sec
+Your message:
+
+is the "meaning" embedded in the IR at runtime or compile time? is it cached between runs for speec?
+Attach
+Assistant Reply:
+
+Short answer
+
+    The “meaning” is extracted at compile time and stored in MT-IR.
+    At runtime, MT-Runtime looks up that MT-IR and binds live values to it to synthesize the prompt.
+    Yes, the MT-IR is registered with the runtime and reused across calls during a process. You can also persist it across runs if your build system caches Jac’s compilation artifacts.
+
+Details
+
+    Compile time:
+        The Jac/MTP compiler analyzes your codebase (across modules) and builds a Meaning-Typed IR (MT-IR) for each by site.
+        MT-IR captures semantically relevant info that would be lost at bytecode level: function/method names, parameter names and types, return type, class/type schemas with recursive expansions, and links between uses and definitions.
+        This keeps the semantic payload compact and avoids shipping entire source into prompts.
+
+    Runtime:
+        When a by site executes, MT-Runtime retrieves the corresponding MT-IR entry and binds actual argument values (and, for methods, relevant object state).
+        It fills a general prompt template with:
+            Action (from the symbol name),
+            Inputs_Information (names/types + bound values),
+            Output_Information (expected return type),
+            Type_Explanations (schemas from MT-IR).
+        Output parsing and auto-correction happen here too.
+
+    Caching and reuse:
+        Within a single process: MT-IR is “registered into the MT-Runtime library” after compilation and remains available for the program’s lifetime. Repeated calls to the same by site reuse the same MT-IR; only the bound values change.
+        Between runs: If you keep Jac’s ahead-of-time compilation outputs (Python bytecode plus the MT-IR registration data) in your build/cache, subsequent runs don’t need to rebuild MT-IR unless source changes. In other words, caching depends on your build setup, but the design supports persisting MT-IR alongside compiled artifacts for speed.
+        No need to re-derive semantics at runtime; only dynamic values are gathered then.
+
+    Cost and speed implications:
+        Prompt synthesis is fast because most work (semantic gathering and schema expansion) is done at compile time.
+        Token use is controlled because MT-IR includes only relevant semantics, not whole source.
+        Reusing MT-IR across calls/runs reduces overhead; the dominant cost remains the LLM inference itself.
+
+GPT-5
+30.99 tok/sec
+512 tokens
+Time-to-First: 3.0 sec
+Your message:
+
+is the meaning stored in natural language or an embedding? how does the model parse the relevant meanings(after the call tree traversal) for the particular operation?
+Attach
+Assistant Reply:
+
+Great questions.
+
+How “meaning” is stored
+
+    It is stored as a structured, symbolic IR (not as natural-language text and not as vector embeddings).
+    MT-IR contains machine-readable elements such as:
+        Symbol identifiers (function/method/class names)
+        Signatures (parameter names, types; return types)
+        Type graphs/schemas (fields, their types; recursive expansions across modules)
+        Use–definition links
+    Think of MT-IR like a typed symbol table plus schema graph specialized to each by call site. It’s compact metadata, not prose and not embeddings.
+
+How the model “gets” the meaning
+
+    The model never sees the raw IR. MT-Runtime turns the IR into a concise, human-readable prompt section at call time.
+    Concretely:
+        Compile time: MT-IR records all relevant symbols/types for the by site (after traversing the call/type graph).
+        Runtime: MT-Runtime binds live argument values and renders a standardized prompt template with:
+            Action: derived from the function/method name (e.g., get_next_level)
+            Inputs_Information: parameter names, their static types from MT-IR, and their bound runtime values
+            Output_Information: the expected return type
+            Type_Explanations: a minimal natural-language-like schema printout synthesized from MT-IR (e.g., “Level(obj): Level(level_id=int, …, map=Map) … Map … Wall … Position …”)
+    This rendering step is where symbolic MT-IR becomes compact natural-language/schema text that LLMs can interpret.
+
+How “relevant meanings” are selected after traversal
+
+    Relevance is determined at compile time by the MT-IR constructor:
+        Start from the by site (function/method/initializer being AI-integrated).
+        Pull the exact signature (names, param types, return types).
+        Recursively resolve any non-primitive types into their definitions (and their nested types), following use–def links across modules.
+        Stop when all referenced types bottom out at primitives or already-included types.
+    The result is a pruned schema graph: only what’s necessary for that by site. That’s what gets rendered at runtime into Type_Explanations.
+
+How the model parses/uses these meanings
+
+    The LLM is guided by:
+        Explicit operation name (Action) hinting intent.
+        Typed inputs with concrete example values.
+        A detailed but minimal output schema (Output_Information + Type_Explanations).
+    MT-Runtime requests a directly constructible output (e.g., Level(...)). After the model responds:
+        MT-Runtime parses the text into the target type (safe evaluation / structured parsing).
+        If there’s a mismatch, MT-Runtime issues a short corrective prompt (“You returned X; expected Level(...). Please return exactly a Level(...)”) and retries up to a limit.
+
+Why not embeddings?
+
+    Embeddings would add complexity (vector stores, retrieval, drift) and are unnecessary here because the program already encodes precise structural intent via names/types/signatures.
+    Structured IR ensures determinism, small prompts, and easy caching; the LLM only needs a succinct schema/values rendering to act correctly.
+
+In short: “Meaning” lives as a structured IR at compile time, is rendered into concise schema-like natural language at runtime, and the LLM is steered by that schema plus example values. The selection of “relevant meaning” comes from the compile-time traversal and pruning that MT-IR performs for each by call site.
+GPT-5
+47.01 tok/sec
+750 tokens
+Time-to-First: 2.4 sec
+Your message:
+
+how extensive are the paper's tests? Do they test with a large amount of different models, or primarily use a handful?
+Attach
+Assistant Reply:
+
+They test both breadth (many tasks) and a decent variety of models, not just a single model.
+
+From the paper’s evaluation:
+
+    Benchmarks and studies
+        13 benchmarks spanning tasks like math (GSM8K), translation, essay review, joke generation, expert answer, odd word out, MCQ reasoning, personality finder, template filling, text-to-type extraction, task management, video‑game level generation, and a Wikipedia ReAct task.
+        A user study with 20 developers across three tasks.
+        Case studies including dynamic video‑game level generation and multimodal (vision) tasks.
+
+    Model coverage
+        Broad comparison uses OpenAI GPT-4o for the full benchmark suite (accuracy figure compares LMQL, DSPy, and MTP on 13 tasks with GPT‑4o).
+        Depth study on GSM8K evaluates across 10 models to show trends over model evolution:
+            OpenAI family: gpt‑3.5‑turbo, gpt‑4, gpt‑4‑turbo, gpt‑4o.
+            Llama family: llama2:7b, llama2:70b, llama3:7b, llama3:70b, llama3.1:7b, llama3.1:70b.
+        They also include multimodal experiments using GPT‑4o for vision Q&A tasks (e.g., CLEVR-style), demonstrating the same abstraction with image inputs.
+
+    What this means
+        For the large task suite, they primarily report with one strong model (GPT‑4o) to compare frameworks fairly.
+        For model diversity, they run a focused, controlled benchmark (GSM8K) across 10 different models/versions to analyze accuracy trends and failure modes (type mismatch, timeouts).
+        So: not “only a handful,” but also not every task over every model. They combine:
+            Wide task coverage on a leading model, and
+            A cross‑model study on a representative task.
+
+Key reported findings tied to model variety
+
+    MTP vs. DSPy on GSM8K across the 10 models: MTP matches or slightly outperforms DSPy on newer models (notably GPT‑4o), shows improving accuracy as models improve, and avoids some DSPy failure modes (type mismatches, timeouts).
+    Token, cost, and runtime comparisons are shown against DSPy (non‑compiled) across the benchmark suite with GPT‑4o.
+
+If you want, I can extract the exact figures/tables relevant to model diversity (GSM8K accuracy plots for OpenAI and Llama families, and the breakdown chart showing accurate/incorrect/timeout/type‑mismatch) and summarize them in a few bullet points.
+GPT-5
+19.39 tok/sec
+578 tokens
+Time-to-First: 2.5 sec
+1 tool call
+Your message:
+
+what are the obstacles to implementing this approach in other runtimes? are there specific aspects of an interpreted language with more natural syntax like python that are needed? Could any of this be done ahead of time in a full compile step that stores the meaning types somewhere?
+Attach
+Assistant Reply:
+
+Short answer
+
+    It’s portable in principle, but easiest in languages/runtimes where you can: (a) get high‑fidelity symbols/types/AST, (b) add a compile pass to build and store a meaning IR tied to call sites, and (c) hook runtime call sites to inject prompts and parse outputs into target types. Python’s strengths (rich introspection, gradual typing, easy AST tooling, dynamic object graphs) make it straightforward, but none of these are exclusive to Python.
+    Yes, much can be done ahead of time: a full compile step can construct and persist MT‑IR artifacts per by site, then the runtime only binds live values and performs I/O with the model.
+
+Key obstacles and what you need to solve them
+
+    Capturing high‑quality semantics (MT‑IR)
+
+    Need reliable front‑end(s) to parse code, resolve symbols across modules/packages, and produce precise type graphs:
+        Dynamic languages: you must augment with static type info (type hints/annotations) or a type checker (e.g., MyPy-like) to avoid under‑specification.
+        Statically typed languages: easier to recover accurate types but you must carry names and field labels (not always preserved after aggressive optimization/minification).
+    Cross‑module resolution and pruning: you need a whole‑program or multi-module analysis to expand only the types reachable from each by site, then prune to primitives to keep prompts small.
+    Obstacle: build systems that split code into separate compilation units or do heavy symbol stripping make it harder. Solution: insert an IR export pass before stripping/obfuscation and attach stable IDs to by sites.
+
+    Attaching the abstraction at call sites
+
+    You need a way to express “this function/method/ctor is serviced by an LLM” and preserve that marker to runtime:
+        Python: custom syntax in a superset (Jac), or decorators/annotations could emulate.
+        Other languages: attributes/annotations (Java, C#, Kotlin), macros/procedural macros (Rust), attributes (C++23), source generators (C#, TypeScript), or compiler plugins.
+    Obstacle: languages without extensible syntax or attribute systems force more boilerplate.
+    Solution: use build‑time codegen to replace bodies or wrap calls with an LLM stub that looks up MT‑IR and executes the flow.
+
+    Runtime value binding
+
+    You must reliably capture argument values and, for methods, relevant object state when the call happens:
+        Reflection/introspection helps (Python, JVM, .NET).
+        In low‑reflection environments (C/C++/Rust), generate small marshalling stubs at build time that serialize values needed for the prompt.
+    Obstacle: limited reflection or strict AOT targets (embedded, iOS static linking).
+    Solution: codegen marshallers at compile time; keep a schema alongside MT‑IR to know what to pack.
+
+    Output parsing into target types with retries
+
+    You need a safe structured parser that maps the model’s text back to the expected type:
+        Options: expression evaluators (as in the paper’s ast.literal_eval style), JSON with schema validation, or language-native deserialization (Pydantic/serde/Jackson).
+    Obstacle: non‑deterministic model text and type mismatches.
+    Solution: emit concise corrective prompts and retry; choose a structured format (JSON/TypeScript types/Protobuf) per ecosystem to reduce ambiguity.
+
+    Token/cost control
+
+    Keeping prompts compact requires pruning IR and rendering concise schemas. If your environment bloats schemas (e.g., verbose generics metadata), token use rises.
+    Solution: design a deterministic, minimal “schema printout” for the LLM that preserves names and primitive leaf types without noise.
+
+    Toolchain and packaging
+
+    You need a stable way to persist MT‑IR:
+        Store as a sidecar file (JSON/CBOR) per module or as an embedded section in compiled artifacts (JAR resources, .NET resources, ELF/COFF sections).
+    Obstacle: dev/prod parity and cache invalidation when sources change.
+    Solution: fingerprint by-site IR with content hashes and integrate with the build cache so IR is regenerated only when dependent symbols change.
+
+How this maps to other ecosystems
+
+    JVM (Java/Kotlin/Scala):
+        Use annotation processors or compiler plugins to collect symbols/types and emit MT‑IR at build time; store in JAR resources.
+        Use reflection or generated stubs to bind values at runtime. Jackson/Moshi can parse JSON outputs back to POJOs; add retry logic.
+    .NET (C#/F#):
+        Source generators/Analyzers to build MT‑IR; attributes to mark by sites.
+        System.Text.Json with source‑generated serializers for output parsing. Reflection is available if needed.
+    Rust:
+        Procedural macros to mark by sites and generate both MT‑IR (at build) and marshalling code.
+        Serde for structured parsing. Limited runtime reflection → rely on generated stubs.
+    C++:
+        Attributes or macro wrappers; Clang tooling/libclang to build MT‑IR as a pre-link step.
+        Use codegen to marshal values; parse JSON back via nlohmann/json or similar.
+    JavaScript/TypeScript:
+        TS compiler API to extract type information and emit MT‑IR; decorators/ts‑transformers to mark by sites.
+        At runtime, values are already dynamic; use zod/io‑ts for validation and corrective retries.
+
+Do you need an “interpreted, natural” language like Python?
+
+    Helpful, not required.
+        Helpful: easy AST tooling, runtime reflection, gradual typing, and human‑readable names typically preserved.
+        Not required: the key is an analysis pass that captures symbol names, structured types, and associations and a runtime hook to bind values and parse responses. Statically typed/AOT ecosystems can be equally (or more) reliable if you preserve names and type metadata in the MT‑IR.
+
+Can this be fully ahead-of-time?
+
+    Mostly yes:
+        Build the per‑site MT‑IR entirely at compile time, store it alongside the binary.
+        Generate marshalling/parsing code at build time to minimize runtime reflection.
+        At runtime, only:
+            Look up the MT‑IR by a site ID,
+            Insert live values,
+            Render the schema snippet,
+            Call the model,
+            Parse/validate, with retries if needed.
+    What cannot be AOT:
+        The actual binding of live values and the LLM call inherently happen at runtime.
+        If the program uses dynamic features that change types/fields at runtime, you’ll need a fallback (e.g., a small reflective augmentation or regenerate IR at startup).
+
+Practical checklist to port MTP to another runtime
+
+    Language integration: choose an annotation/macro/decorator to mark by sites.
+    Compiler hook: add a pass to export MT‑IR for each by site, resolving cross‑module types down to primitives; give each site a stable ID and hash.
+    Storage: persist MT‑IR in sidecar/resource files; wire cache invalidation.
+    Runtime library: implement prompt renderer from MT‑IR + values; model client; structured parser + corrective retries; telemetry for token/runtime metrics.
+    Formats: pick a canonical schema rendering (concise, deterministic) and a canonical output format (expression or JSON) for reliable parsing.
+
+Bottom line
+
+    Python makes this approach convenient, but the core ideas—compile-time semantic capture (MT‑IR), minimal runtime binding, and type‑safe output handling—are general. With the right compiler hooks (or codegen) and a small runtime, you can implement MTP‑style meaning‑typed prompting in JVM/.NET/Rust/C++/TS, and you can push most of the heavy lifting into a full ahead‑of‑time compile step that stores the “meaning types” for fast reuse.
+
+GPT-5
+25.55 tok/sec
+1657 tokens
+Time-to-First: 2.4 sec
+
