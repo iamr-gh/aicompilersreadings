@@ -1,0 +1,189 @@
+TorchBench Benchmarking PyTorch with High API Surface Coverage - T3 Chat
+New Thread
+Press Enter to send, Shift + Enter for new line
+Attach
+Your message:
+
+I'm reading the torchbench paper, is it correct that these benchmarks were primarily for the purpose of pytorch development, and not for comparison against other models?
+torchbench.pdf
+Attach
+Assistant Reply:
+
+Short answer: yes.
+
+TorchBench was designed primarily to evaluate and improve the PyTorch software stack itself (models, framework, and GPU libraries), not to compare hardware platforms or different DL frameworks against each other. The paper contrasts this explicitly with MLPerf, which focuses on end-to-end, cross-framework/hardware comparisons.
+
+Key points:
+
+    Scope: TorchBench slices models to focus on the compute-intensive portion and runs them under PyTorch to diagnose performance issues (GPU idleness, data movement, compiler backend behavior).
+    Goal: High PyTorch API surface coverage to surface performance bugs/regressions and guide optimizations; it’s integrated into PyTorch’s CI for regression detection.
+    Not intended for cross-framework comparisons: Unlike MLPerf, TorchBench benchmarks PyTorch only and emphasizes internal characterization and optimization rather than “who’s faster” across frameworks/hardware.
+
+GPT-5
+75.23 tok/sec
+178 tokens
+Time-to-First: 1.6 sec
+Your message:
+
+how much of this benchmark suite is meant for gpu? is it considered a good survey of CPU or other kinds of hardware
+Attach
+Assistant Reply:
+
+Mostly GPU-focused.
+
+    Intent: TorchBench was built to study and optimize the PyTorch software stack with an emphasis on GPU execution. The methodology slices models to the compute-intensive section, assumes data is already on device, and reports GPU-centric metrics (e.g., GPU active time vs. idleness, CPU↔GPU data movement). Many analyses target CUDA/cuDNN, TorchInductor’s GPU codegen (Triton), and comparisons between NVIDIA A100 and AMD MI210.
+
+    Coverage: It includes 84 models across domains to maximize PyTorch API surface, but the characterization and optimizations are primarily about GPU behavior and GPU libraries. The paper’s detailed results and case studies (kernel fusion, guard checks, cuBLAS workspace, ROCm vs. CUDA) are GPU-centric.
+
+    CPU and “other hardware”: While TorchBench can run on CPU and the CI measures CPU execution time and memory (and detects CPU regressions), the paper does not present a broad, systematic CPU performance study, nor does it position TorchBench as a general survey for CPUs, TPUs, or accelerators. It’s not intended as a comprehensive benchmark for non-GPU hardware.
+
+Bottom line: Use TorchBench if you want a broad, realistic GPU workload mix to evaluate PyTorch performance and regressions. Don’t treat it as a definitive suite for CPU or other accelerators. If you need cross-hardware or CPU-focused comparisons, consider complementary suites/tools (e.g., MLPerf for cross-platform, microbenchmarks for CPU operators) or augment TorchBench with targeted CPU workloads and metrics.
+GPT-5
+69.03 tok/sec
+327 tokens
+Time-to-First: 1.8 sec
+Your message:
+
+does this benchmark contain tests related to ML deployments? how these models might perform when used by many users at once/on server grade GPUs? are runtimes like vLLM orthogonal or something that could be used as part of this testing framework
+Attach
+Assistant Reply:
+
+Short answer: TorchBench is not a deployment/serving benchmark. It’s primarily a single-model, single-GPU, compute-phase benchmark for PyTorch internals.
+
+Details:
+
+    Deployment/throughput scenarios: The paper’s methodology slices models to the compute-intensive section, runs 1 iteration repeatedly, and assumes data is already on device. It does not model end-to-end serving concerns like request batching dynamics, concurrent users, queuing, network I/O, dataset/feature stores, model warmup, autoscaling, or multi-instance scheduling. So it’s not a load/latency/throughput serving benchmark.
+
+    Many-users-at-once / server-grade GPUs: The evaluations focus on per-model performance on a single high-end GPU (e.g., A100, MI210) and analyze GPU active time, data movement, compiler backends (TorchInductor), and regressions. It doesn’t simulate concurrent requests, multi-tenant contention, or multi-GPU serving topologies. You could run TorchBench on server-grade GPUs, but it won’t by itself tell you how a service scales under concurrent load.
+
+    Where TorchBench helps for deployment: It’s useful for identifying kernel- and framework-level inefficiencies that also matter in production (e.g., GPU idleness, kernel fusion, memory bloat). Those optimizations can translate to better serving efficiency, but TorchBench doesn’t measure production KPIs like p50/p99 latency under QPS, elasticity, or tail behavior.
+
+    vLLM and similar runtimes: Runtimes like vLLM (PagedAttention-based LLM serving) are orthogonal to TorchBench’s original scope. They target serving-time optimizations (request batching/scheduling, KV-cache management, context/streaming, multi-tenancy). You could integrate such runtimes into a broader test harness alongside TorchBench, but:
+        Out of the box, TorchBench runs PyTorch models via PyTorch execution paths; it does not include vLLM-style inference servers.
+        To evaluate vLLM (or TensorRT-LLM, TGI, FasterTransformer, Ollama, etc.), you’d typically use serving benchmarks that drive concurrent requests and measure throughput/latency/tail (e.g., custom load generators, Locust/hey/wrk, or framework-provided perf tools).
+
+Recommendations if you care about deployment performance:
+
+    Keep TorchBench for low-level PyTorch regression testing and GPU kernel efficiency.
+    Add a serving benchmark layer for concurrency:
+        Choose a serving stack: vLLM/TensorRT-LLM/TGI/TorchServe/FastAPI+torch.compile.
+        Drive realistic load: concurrent users, variable sequence lengths, dynamic batching, streaming.
+        Track KPIs: throughput (tokens/s), p50/p95/p99 latency, GPU/CPU/memory utilization, cost per token, stability.
+        Test across hardware: A100/H100 vs. MI250/MI300, different memory sizes, multi-GPU sharding.
+    For LLMs specifically, vLLM can be part of your test matrix; compare PyTorch eager/torch.compile, TensorRT-LLM, and vLLM under identical prompts and loads to see serving trade-offs.
+
+Bottom line: TorchBench is great for PyTorch performance characterization but is not a serving/deployment benchmark. Runtimes like vLLM address a different layer and should be evaluated with a load-testing harness designed for concurrent inference. You can complement TorchBench with such tests; they are not mutually exclusive.
+GPT-5
+93.99 tok/sec
+726 tokens
+Time-to-First: 1.8 sec
+Your message:
+
+other than MLPerf, are there any more modern comprehensive benchmarks meant for comparing frameworks against each other?
+Attach
+Assistant Reply:
+
+Yes—there are several modern, cross-framework benchmarking efforts beyond MLPerf, but they target different layers (training vs. inference, foundation models vs. TinyML, serving stacks, etc.). A quick map:
+
+Cross-framework training/inference suites
+
+    MLCommons MLPerf (Training/Inference/Tiny): still the de facto standard; keeps adding LLM fine-tuning and GNN tasks and recently moved GPT-3 pretraining to Llama 3.1 405B style workloads.
+    DLBench (Cluster Computing 2021): comparative evaluation of TensorFlow, MXNet, PyTorch, Theano, Chainer, Keras across CNN/Faster R-CNN/LSTM on CPU/GPU. Older, but truly cross-framework.
+
+Foundation-model/LLM evaluation frameworks (capabilities/quality, not just speed)
+
+    Stanford HELM: holistic, reproducible, multi-scenario, multi-metric evaluation across many models; expanding with AIR-Bench 2024 for safety/risk. Focuses on quality, safety, and transparency rather than raw performance.
+    Enterprise HELM (IBM, 2024): extends HELM with domain-specific enterprise datasets (finance, legal, cybersecurity, climate) for cross-model comparisons.
+
+Serving/inference backends and LLM runtime benchmarks (throughput/latency under load)
+
+    Vendor/OSS studies and tools:
+        NVIDIA TensorRT-LLM benchmarking (trtllm-bench, GenAI-Perf): standardized load gen, TTFT/TPOT/throughput metrics for CUDA stacks.
+        BentoML benchmarks and llm-optimizer (2024–2025): compares vLLM, TensorRT-LLM, LMDeploy, TGI; provides an open tool and a web explorer to benchmark/tune LLM serving configs across frameworks.
+        Community comparisons (vLLM vs TGI vs TensorRT-LLM) and platform write-ups are common; not standards, but useful for cross-runtime comparisons.
+    These are practical for comparing serving frameworks (vLLM, TensorRT-LLM, TGI, LMDeploy) rather than core DL frameworks like PyTorch vs TensorFlow.
+
+Edge/TinyML cross-framework
+
+    MLPerf Tiny: standardized TinyML tasks across runtimes/hardware.
+    EdgeMark (2025): automates deployment and benchmarking across multiple embedded AI toolchains; broader than a single framework and useful for cross-runtime/device comparisons.
+
+Takeaways
+
+    For classic “framework vs framework” at the DL stack level, MLPerf remains the primary, living suite; DLBench is a research snapshot. TorchBench is PyTorch-centric.
+    For modern LLMs, “comprehensive” increasingly means quality/safety (HELM/AIR-Bench) plus separate serving-performance benchmarks (TensorRT-LLM tools, BentoML’s llm-optimizer) comparing inference frameworks.
+    For edge, MLPerf Tiny and emerging systems like EdgeMark provide cross-tool/hardware comparisons.
+
+If you share what layer you want to compare (training frameworks, ONNX/RT runtimes, LLM serving stacks, or edge toolchains), I can point you to the most relevant benchmark and a concrete runbook.
+GPT-5
+27.40 tok/sec
+654 tokens
+Time-to-First: 1.5 sec
+1 tool call
+Your message:
+
+is it possible to run alternative paths than inductor using torch bench? like torch XLA, or torch-MLIR->IREE or other adhoc lowerings
+Attach
+Assistant Reply:
+
+Short answer: mostly yes for PyTorch-supported backends, with some caveats.
+
+What TorchBench supports out of the box
+
+    Eager (default PyTorch)
+    torch.compile with TorchDynamo front-end and multiple backends:
+        Inductor (default/triton)
+        AOTAutograd + backends (e.g., nvFuser for older stacks)
+    Some models also have TorchScript paths, but coverage is uneven.
+
+Backends you asked about
+
+    TorchXLA (TPU/CPU/GPU via XLA):
+        Possible, but not turnkey. TorchBench focuses on single-GPU compute-phase runs and its CI targets CUDA/ROCm. To use TorchXLA, you’d need:
+            XLA-enabled PyTorch build and environment (e.g., TPU VM or XLA GPU build).
+            Model-by-model validation because not all ops/shape dynamics trace cleanly.
+            Adapt the harness to launch with XLA flags and initialize XLA devices.
+        Community users have run subsets of TorchBench on XLA, but expect engineering effort and gaps.
+
+    torch-mlir -> IREE (or other MLIR-based lowerings):
+        Not supported out of the box. You can prototype, but it’s an integration project:
+            Export: Capture a stable graph from PyTorch (TorchDynamo/AOT + FX/ATen IR), lower through torch-mlir.
+            Compile: Use IREE to target your desired backend (Vulkan, CUDA, ROCm, CPU).
+            Execute: Wrap the IREE runtime invocation so TorchBench’s harness can feed inputs and collect timings/memory.
+        Pain points: dynamic shapes, op coverage parity with ATen, dtype/precision nuances, and aligning measurement semantics with TorchBench (compute-only slice, warmup, med-of-10 runs).
+
+    Other ad hoc lowerings (e.g., ONNX -> ONNX Runtime/TensorRT, TVM, AITemplate):
+        Feasible with custom adapters. Several folks have built “external runner” shims that:
+            Export the model (TorchDynamo/AOT or ONNX).
+            Compile with the target stack.
+            Implement a callable that matches TorchBench’s run() signature and reports metrics.
+        Expect per-model exceptions and feature gaps.
+
+Practical guidance
+
+    Start with torch.compile backends that TorchBench already toggles:
+        Try different backends by setting TORCH_COMPILE_BACKEND or code-wrapping with torch.compile(model, backend="...").
+        Validate correctness and collect time/memory to compare with eager/Inductor.
+
+    For XLA:
+        Pick a small subset of models (e.g., ResNet50, BERT, T5-base).
+        Stand up an XLA environment (TPU or XLA:GPU), add a launcher script that:
+            Sets XLA flags, initializes devices, and ensures inputs land on XLA.
+            Runs the same single-iteration compute slice and repeats.
+        Expect to skip unsupported models and ops.
+
+    For torch-mlir -> IREE:
+        Choose static-ish models first (CNNs before highly dynamic transformers).
+        Build an exporter from FX/ATen to torch-mlir, then compile with IREE.
+        Implement an adapter to run the compiled module and feed TorchBench inputs.
+        Compare against eager for sanity and report med-of-10.
+
+Bottom line
+
+    TorchBench is flexible enough to host alternative compilation/execution paths, but only Inductor and mainstream PyTorch backends are “batteries included.”
+    XLA and MLIR/IREE paths are possible with custom glue; expect engineering work, partial coverage, and careful validation. If you want, tell me which models/hardware you target and I can sketch a minimal adapter scaffold.
+
+GPT-5
+91.33 tok/sec
+798 tokens
+Time-to-First: 0.96 sec
