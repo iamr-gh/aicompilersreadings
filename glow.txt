@@ -1,0 +1,147 @@
+New Thread
+Press Enter to send, Shift + Enter for new line
+Attach
+Your message:
+
+This paper seems to be pretty impressive given the time, did these ideas get folded into pytorch?
+glow.pdf
+Attach
+Assistant Reply:
+
+Short answer: yes—many of Glow’s ideas influenced PyTorch, though they weren’t “merged” as-is.
+
+What carried over conceptually
+
+    Graph lowering and multi-level IRs: PyTorch 2.x’s compile stack (TorchDynamo + AOTAutograd + TorchInductor) captures graphs and lowers them through progressively more targetable IRs, similar in spirit to Glow’s high-level graph → low-level IR approach.
+    Operator fusion/stacking and memory-aware codegen: TorchInductor and nvFuser/Triton perform fusion and tile/schedule kernels to reduce memory traffic, echoing Glow’s operator stacking and memory planning.
+    Quantization as a compiler pass: PyTorch’s quantization flows (eager/PTQ/QAT) and backend-specific lowering reflect Glow’s notion of turning fp32 graphs into efficient int8 islands and minimizing rescale/conversions.
+    Backend modularity: PyTorch exposes multiple backends under torch.compile (Inductor by default, plus TensorRT, TVM, IPEX/OpenVINO, etc.), akin to Glow’s “many backends via a common IR” goal.
+    AOT deployment: AOTInductor compiles exported PyTorch models to shared libraries for non-Python deployment, similar to Glow’s AOT “bundles.”
+
+What did not literally fold in
+
+    Glow remains a separate project (github.com/pytorch/glow) used by some hardware partners and embedded targets; it’s not the core path for PyTorch 2.x models.
+    PyTorch’s modern compiler stack is TorchInductor-centric (with Triton on GPUs), not Glow’s IR/codegen.
+
+If you’re in PyTorch today
+
+    Use torch.compile for most training/inference speedups.
+    For deployment without Python, look at torch.export + AOTInductor.
+    For specific accelerators/edge, vendors may still provide Glow-based paths; otherwise use backend integrations (TensorRT, TVM, IPEX/OpenVINO) via torch.compile.
+
+So, Glow’s architecture and lessons helped shape the direction of PyTorch’s compiler era, but the implementation you use in PyTorch 2.x is TorchInductor-based rather than Glow itself.
+GPT-5
+34.24 tok/sec
+452 tokens
+Time-to-First: 1.8 sec
+1 tool call
+Your message:
+
+pytorch seems to have dropped the profile guided aspect, why did that happen
+Attach
+Assistant Reply:
+
+Great observation. The short version is: PyTorch moved away from explicit profile-guided compilation because newer techniques gave similar (or better) performance with less overhead and fewer correctness pitfalls.
+
+Key reasons:
+
+    Lower overhead and faster startup: Profiling-based schemes require running warmup/profile passes to collect shapes/ranges/branch behavior, which delays first-use latency and complicates caching. PyTorch 2.x prioritized “zero or minimal warmup” with ahead-of-time capture (TorchDynamo) and speculative specializations.
+    Dynamic shape support matured: Instead of profiling to learn shapes, PyTorch shifted to symbolic shape reasoning (SymInt) and guards. TorchDynamo records guards on tensor ranks/dtypes/stride patterns, and TorchInductor generates kernels that handle families of shapes or recompiles on guard breaks. This reduces the need for separate profiling runs.
+    Better fusion/codegen without profiling: nvFuser (earlier) and now TorchInductor+Triton can fuse and tile effectively using static analysis and conservative cost models, avoiding runtime instrumentation. For CPUs, Inductor’s loop-level IR and scheduler can make good locality/tile choices with compile-time heuristics.
+    Stability and determinism: Profile-guided passes can be brittle—changes in input distributions or rare branches can invalidate assumptions, causing deoptimizations or recompiles at awkward times. Guarded specialization yields clearer, testable contracts: if a guard fails, fall back or recompile; otherwise behavior is deterministic.
+    Quantization moved to calibration and QAT: Instead of in-graph runtime profiling to infer activation ranges (like Glow’s profiling nodes), PyTorch’s quantization flows rely on explicit calibration passes (PTQ) or fake-quant during QAT. These are opt-in and decoupled from the general compiler path, keeping torch.compile simpler.
+    Simpler UX and integration: Removing mandatory profiling phases makes torch.compile easier to adopt in training loops, distributed settings, and tracing/export flows. It also aligns better with ahead-of-time export (torch.export + AOTInductor), where you don’t want runtime profiling baked in.
+
+What remains “profile-like”
+
+    Guarded specialization is a form of speculative optimization: the first execution captures a graph with guards; if inputs violate guards later, PyTorch recompiles another specialized version. That’s closer to JIT specialization than classic PGO, but serves a similar purpose—optimize for common cases without global profiling.
+    Optional calibration for quantization still exists, but it’s a deliberate step rather than automatic profiling inserted by the compiler.
+
+Net effect: PyTorch got most of the benefits Glow sought from profiling—good fusion, memory locality, dtype/shape specialization—via guard-based specialization, symbolic shapes, and strong codegen, while avoiding the complexity and latency costs of a profiling phase.
+GPT-5
+52.28 tok/sec
+573 tokens
+Time-to-First: 2.6 sec
+Your message:
+
+is mlir influenced by glow in any form
+Assistant Reply:
+
+Short answer: not directly. MLIR and Glow were developed around the same time and share motivations, but MLIR was not derived from Glow.
+
+How they relate
+
+    Common goals: Both aim to make it easier to compile ML models to diverse hardware by using multiple IR levels, graph-to-kernel lowering, and target-specific legalization. So you’ll see similar ideas (multi-level IRs, dialects/ops vs. nodes/instructions, lowering passes).
+    Different origins and scope:
+        Glow: a Facebook/Meta project focused specifically on NN inference/training graphs, with two main IRs (node IR and low-level address-only IR) and a runtime. It targets heterogeneous accelerators with aggressive graph lowering and memory planning.
+        MLIR: a general-purpose, extensible compiler infrastructure from Google (now widely used across LLVM/Clang, TensorFlow, PyTorch backends, XLA, IREE, OpenXLA StableHLO, etc.). It provides a framework for building many IR “dialects,” rewrite patterns, type systems, and canonicalization, not just for ML.
+    Cross-pollination vs. influence: The high-level ideas in the ML compiler community (XLA, TVM/Halide, Glow, nGraph, Tensor Comprehensions) all informed each other. MLIR’s design docs cite the need to support multiple abstraction levels and domain-specific dialects; this reflects community consensus rather than a specific adoption of Glow’s IRs.
+
+Practical intersections today
+
+    PyTorch uses MLIR in some projects (e.g., through external backends or export paths), while Glow remains its own stack. There isn’t an “MLIR dialect for Glow” that replaced Glow’s IR.
+    Many of the transformations Glow performs (node lowering, quantization-aware rewrites, memory planning) have analogous passes/dialects in MLIR ecosystems (e.g., TOSA, StableHLO, Linalg, Bufferization), but they are independent implementations.
+
+Bottom line: MLIR and Glow are parallel products of the same era and problem space. They share philosophies about multi-level IR and lowering for heterogeneous targets, but MLIR wasn’t based on Glow, nor did it subsume Glow’s IRs.
+GPT-5
+53.99 tok/sec
+459 tokens
+Time-to-First: 1.0 sec
+Your message:
+
+are there any other projects that were inspired by glow? was it before or after the release of llama
+Attach
+Assistant Reply:
+
+Short answer: There isn’t a clear public record of major projects explicitly citing “inspired by Glow,” but Glow was part of a broader wave of ML compiler work that influenced the ecosystem’s direction. Many contemporaneous or subsequent projects share similar ideas, likely due to cross-pollination in the community rather than direct lineage. Glow also predates LLaMA by years.
+
+Timeline context
+
+    Glow initial public release: 2018 (paper updated 2019).
+    LLaMA (Meta): first released Feb 2023; Llama 2 in July 2023; Llama 3 in 2024.
+
+Projects with overlapping ideas/philosophy (not necessarily “inspired by” Glow)
+
+    PyTorch 2.x compiler stack (TorchDynamo, AOTAutograd, TorchInductor, Triton): multi-level lowering, fusion, memory-aware codegen—conceptually aligned with Glow’s goals. Influence is indirect; PyTorch didn’t adopt Glow’s IRs.
+    IREE (by Google/LLVM community): MLIR-based end-to-end compiler/runtime targeting CPUs, GPUs, and mobile; has multi-level IRs, bufferization, static memory planning—very similar themes.
+    OpenXLA (XLA next-gen), StableHLO, MHLO: standardized high-level ops and lowering to many backends.
+    TVM (and Relay/TIR), Halide-derived approaches: contemporaries that converged on similar multi-level IR and auto-scheduling ideas.
+    nGraph (Intel), TensorRT-LLM, AITemplate (Meta, 2022): graph-level optimizations, codegen for accelerators, kernel fusion/tiling; AITemplate in particular echoes Glow’s focus on ahead-of-time, high-performance inference for GPUs/accelerators with template-based codegen.
+    ONNX Runtime with EPs (Execution Providers): modular backends with graph partitioning and lowering, similar in spirit to Glow’s backend model.
+    OpenVINO, IPEX: Intel’s stacks that do graph rewrites, quantization, backend-specific codegen.
+
+Vendor/edge stacks
+
+    Several accelerator vendors announced Glow support around 2018–2019. Some internal/partner compilers and firmware-level toolchains likely borrowed concepts (node lowering to a small set of primitives, static memory planning), though detailed public attributions are sparse.
+
+Answering your two questions directly
+
+    Are there projects inspired by Glow? Nothing widely cited as “derived from Glow,” but Glow contributed to the shared design playbook for ML compilers (multi-level IRs, node-lowering to linear algebra primitives, operator stacking/fusion, static memory planning, quantization as a compiler pass). You see these patterns across IREE, AITemplate, TorchInductor-era PyTorch, and ONNX Runtime EPs.
+    Was it before or after LLaMA? Glow was well before LLaMA (2018 vs. 2023). Many later systems (including LLM-specific compilers like AITemplate, TensorRT-LLM, and vLLM optimizations) arrived after LLaMA, but the core compiler ideas existed years earlier with Glow, XLA, TVM, Halide, etc.
+
+If you want, I can compile a brief, source-linked timeline of key ML compiler releases around Glow and after LLaMA.
+GPT-5
+65.10 tok/sec
+688 tokens
+Time-to-First: 0.95 sec
+Your message:
+
+what was the last time glow was used on a real project
+Assistant Reply:
+
+Publicly verifiable “real project” uses of Glow taper off around 2020–2021, with occasional vendor/edge integrations after that. Key datapoints:
+
+    NXP eIQ (edge/MCU): In August 2020 NXP announced Glow integration for i.MX RT MCUs and HiFi 4 DSP to get 2–3x speedups and low memory footprint on edge workloads. This is one of the clearest production-style uses on real hardware.
+
+    Qualcomm/partners: Around 2018–2021 several accelerator vendors (Qualcomm, Cadence/Tensilica, etc.) built or explored Glow backends; some of this shipped inside vendor SDKs/firmware or evaluations for Hexagon/Tensilica targets. Public case studies are sparse after 2021.
+
+    Project status: Meta opened an issue in Sept 2023 titled “Sunsetting Glow Active Development,” and the GitHub repo was archived and made read‑only on July 1, 2025. That strongly suggests no current production evolution inside Meta, and that partners have largely moved on.
+
+    Inside Meta, the practical focus shifted to PyTorch 2.x compilers (TorchInductor) and to AITemplate (released 2022) for high‑performance GPU inference, rather than Glow.
+
+So, the last widely documented “real project” use was NXP’s 2020 eIQ integration for i.MX RT MCUs; after that, Glow appears to have seen limited, vendor‑specific or maintenance‑only use, and is now archived. If you have a particular hardware stack in mind, I can check whether that vendor still ships a Glow-based toolchain or has migrated to ONNX Runtime EPs, TVM, AITemplate, or PyTorch ExecuTorch/Inductor paths.
+GPT-5
+27.09 tok/sec
+379 tokens
+Time-to-First: 1.6 sec
+1 tool call
