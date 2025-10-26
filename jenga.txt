@@ -1,0 +1,275 @@
+New Thread
+Press Enter to send, Shift + Enter for new line
+Attach
+Your message:
+
+In this paper, they assume that heterogenous models are becoming more popular. Are there are any production models using Mamba layers?
+jenga.pdf
+Attach
+Assistant Reply:
+
+Yes. A few notable, production-oriented releases that use Mamba (state-space) layers or hybrid Transformer–Mamba designs:
+
+    AI21 Labs Jamba family (2024–2025): Hybrid Transformer–Mamba(+MoE) models with open weights and commercial deployment via AI21’s platform (and cloud offerings like Bedrock). Jamba 1.5 Mini/Large and subsequent Jamba variants are positioned explicitly for production use and long-context serving.
+
+    NVIDIA Hymba (2024–2025): Open-weight small LMs with hybrid heads (attention + Mamba/Mamba-2) focused on efficient inference and reduced KV memory; released on Hugging Face and used as a reference for efficient SLM serving.
+
+    NVIDIA Nemotron-Nano/Nemotron-H (2025): Hybrid Mamba–Transformer models (most layers Mamba-2) marketed as “production-ready enterprise” models with high throughput and long-context support.
+
+    IBM Granite 4.0 (2025): Open-source hybrid Mamba–Transformer family under Apache 2.0, positioned for enterprise deployment (watsonx.ai), emphasizing memory reduction and instruction-following performance.
+
+    Together AI Mamba-Llama (2024): A hybridized/distilled Llama variant that replaces most attention layers with Mamba blocks; released for practical serving with 128K context.
+
+    Mistral Codestral Mamba (2024): A pure Mamba2-based code model aimed at large-context coding workflows.
+
+These, plus ongoing work like Amazon’s Marconi (serving-side prefix caching tuned for hybrid/SSM models), indicate Mamba/Hybrid SSM layers have moved beyond research into real deployments.
+GPT-5
+26.93 tok/sec
+349 tokens
+Time-to-First: 2.2 sec
+1 tool call
+Your message:
+
+Outside of mamba, how do these methods apply to multimodal
+Assistant Reply:
+
+Short answer: Quite well. Jenga’s two big ideas—(1) two-level allocation with an LCM “compatibility” page and (2) layer-specific prefix caching/eviction—map cleanly to multimodal systems even when there’s no Mamba.
+
+Where it applies in multimodal models:
+
+    Vision encoders and image embeddings
+        Different embedding sizes: Vision encoder outputs (image tokens) typically have a different per-token state size than text KV. Jenga’s LCM allocator lets you pack both without fragmentation by carving large pages into small per-type pages (e.g., 256B for image tokens, 384B for text tokens).
+        Reuse vs. recompute: With chunked prefill, Jenga can either:
+            Allocate-on-demand KV and free image embeddings once consumed, keeping peak small; or
+            Reuse the (already allocated) KV region for the image embeddings during the first chunk, driving the image-embedding peak to near zero.
+    Cross-attention layers
+        Separate caches: Cross-attention (text attending to image features) has different dependency than self-attention. Jenga maintains separate small-page allocators for cross-attn “encoder KV” and for self-attn “decoder KV”.
+        Eviction/hit rules: Cross-attn often requires the whole image’s embeddings intact to avoid re-running the vision encoder. Jenga’s prefix-subset evictor can group image pages per image and evict at image granularity (aligned eviction) instead of scattering tokens across images.
+    Mixed sparse/full attention in multimodal decoders
+        Sliding window or token-dropping layers alongside full self-attention are common. Jenga’s layer-specific get_possible_prefix and update_last_access let those layers only “care” about the last W tokens while full layers still require the full prefix.
+        This avoids keeping unnecessary KV for image or text tokens that fall outside windows/dropped sets, reducing waste.
+    Speculative decoding with multimodal prompts
+        Draft and target models have different KV sizes; LCM allocator shares GPU memory across both without coarse overprovisioning. That matters when images and long text are combined.
+
+What you get in practice (from the paper’s cases):
+
+    Vision-language models (e.g., LLaVA-OneVision, InternVL, Phi-3 Vision, Paligemma2):
+        Throughput and latency gains by caching image embeddings once and by packing image/text states tightly.
+        No peak blow-up: image embedding cache can be freed or overlaid with KV during chunked prefill.
+    Cross-attention VLMs (e.g., Llama 3.2 Vision, NVLM-type designs):
+        Avoids the “allocate everything everywhere” pitfall of uniform paging; stores image-token caches only for cross-attn, text-token caches only for self-attn.
+        Balanced and aligned eviction across layer types improves prefix cache hit rate when multiple long multimodal requests compete.
+
+When to expect the most benefit:
+
+    Any VLM where image-token states are different size than text KV (most of them).
+    Decoders that interleave self-attn with cross-attn or sliding-window layers.
+    Workloads with chunked prefill over long image-text sequences, or batchy QA over many images/documents.
+
+What you don’t need Mamba for:
+
+    The LCM two-level allocator directly addresses heterogeneous state sizes (vision vs text, cross-attn vs self-attn) even without SSMs.
+    Prefix-subset evictor helps any non-full-prefix dependency (sliding windows, token dropping, cross-attn image-grouping).
+
+If you want, I can sketch concrete allocator settings for a specific VLM you use (page sizes per layer type, eviction policy knobs, and chunked prefill plan) or provide a small example integrating Jenga-like policies into vLLM for a cross-attention VLM.
+GPT-5
+56.62 tok/sec
+810 tokens
+Time-to-First: 1.8 sec
+Your message:
+
+can you explain exactly how traditional vllm falls short in these applications?
+Attach
+Assistant Reply:
+
+Here’s where “traditional” vLLM (i.e., stock PagedAttention with a single uniform page size and full-prefix semantics) runs into trouble for multimodal and heterogeneous models:
+
+    One page size for everything → fragmentation and wasted memory
+
+    What vLLM does: Picks a single page size (multiple of one embedding size) and uses it for all KV/embeddings across all layers.
+    Why it breaks with heterogeneity:
+        Different per-token sizes: Text self-attention KV vs. vision embeddings vs. cross-attention encoder KV often have different sizes. If you size pages for text KV, image pages either waste slack space or force awkward packing; if you size for images, text KV wastes space.
+        Mixed architectures: Models that interleave self-attention and cross-attention (or sliding window, token dropping) need different page granularities. A single page size can’t fit all without internal fragmentation.
+    Result: Large portions of allocated KV memory are “allocated but unused,” limiting batch size and throughput.
+
+    Layer-page memory layout prevents flexible sharing
+
+    What vLLM does: Uses a layer-first layout (layer-page partition). Each logical page is split across layer slices in physical memory.
+    Why it hurts multimodal: You cannot easily “give back” physical pages from one type (e.g., image encoder KV) and lend them to another type (e.g., text self-attention) without moving data or over-allocating. This constrains reusing freed space from vision chunks or cross-attention phases.
+    Result: Even if some layer’s cache is idle/evictable, its memory is stranded and can’t be repurposed efficiently.
+
+    Assumes full-prefix dependency for cache hit logic
+
+    What vLLM does: Prefix caching is effectively all-or-nothing; a prefix hit requires all earlier tokens to be present.
+    Why it breaks:
+        Sliding-window layers only need the last W tokens; older tokens outside the window should be safely evictable without harming hits.
+        Token-dropping schemes (e.g., PyramidKV) or other sparse attention variants don’t need the full prefix.
+        Cross-attention to images often needs whole-image embeddings intact, but not every text token’s KV for all layers.
+    Result: vLLM either keeps too much KV around (hurting capacity) or, if it evicts without layer-aware rules, loses hits it could have kept under layer-specific semantics.
+
+    No per-layer eviction alignment or balancing
+
+    What vLLM does: Uses global LRU-like eviction without coordinating among layer types.
+    Why it matters:
+        A model-level prefix hit requires that the same token be present across all relevant caches. If self-attention keeps token X but cross-attention evicts X’s image pages (or vice versa), you lose the hit.
+        For sliding-window layers, pages outside the window should be evicted first; for cross-attention, eviction should happen at whole-image granularity to avoid re-running the vision encoder.
+    Result: Lower effective prefix hit rates and avoidable recomputation, especially under mixed workloads.
+
+    Vision embedding handling during chunked prefill is inefficient
+
+    What vLLM often does: Re-run the vision encoder per chunk or hold image embeddings in memory without smart reuse.
+    What’s missing:
+        Overlay/reuse: The ability to reuse the space that will later hold KV cache to temporarily host image embeddings during the first chunk, eliminating peak blow-up.
+        Consume-and-free: Fine-grained freeing of image embeddings immediately after each chunk consumes them, coordinated with KV growth.
+    Result: Extra vision compute or higher peak memory, both limiting batch size and throughput.
+
+    Speculative decoding across models suffers from a single page size
+
+    What vLLM does: Uses the same page size for both draft and target models.
+    Why it hurts: Draft and target models have very different KV sizes. Uniform pages force one side to waste space badly or force many tokens-per-page, which coarsens allocation and hurts cache hits/evictions.
+    Result: Lower throughput and/or reduced batch size compared to an allocator that adapts per-model.
+
+What changes when you adopt Jenga-like mechanisms
+
+    Two-level allocator with LCM-compatible “large pages” and per-type “small pages”
+        Eliminates external fragmentation and minimizes internal fragmentation across different KV/embedding sizes (text vs image vs cross-attn).
+        Request-aware packing keeps pages of a request together, so when a request completes, whole large pages can be returned.
+    Page-layer layout
+        Makes each small page physically contiguous, enabling real page exchange between types and better reuse across phases (e.g., vision-to-text transitions).
+    Layer-specific cache hit and eviction
+        Sliding-window layers only require last W tokens; cross-attn uses image-group eviction; self-attn still uses full-prefix.
+        Balanced and aligned eviction across types preserves the same tokens across layers, improving end-to-end prefix hit rates.
+    Vision embedding optimizations
+        Consume-and-free or KV-overlay approaches prevent peak memory spikes and avoid re-running the vision encoder across chunks.
+    Multi-model/speculative support
+        Different KV sizes are first-class citizens; memory can be shared without penalizing one model’s page geometry.
+
+Concrete symptoms you’ll see in stock vLLM on these workloads
+
+    Lower achievable batch sizes at decode time for mixed text-image prompts.
+    Frequent “allocated but wasted” KV memory when serving cross-attention VLMs or sliding-window models.
+    Reduced prefix cache hit rates when multiple long multimodal requests share content.
+    Re-running the vision encoder during chunked prefill or maintaining unnecessarily large image caches.
+    Speculative decoding failing to deliver expected gains on heterogeneous or multimodal requests due to page-size mismatch.
+
+If you share a specific model/workload (e.g., Llama 3.2 Vision with certain chunk size and image count, or a sliding-window VLM with 64K context), I can outline the exact memory accounting that shows where vLLM wastes space and how a Jenga-style allocator would re-pack it.
+GPT-5
+66.74 tok/sec
+1266 tokens
+Time-to-First: 1.0 sec
+Your message:
+
+what is the difference between self and cross attention
+Assistant Reply:
+
+Here’s the difference at a glance:
+
+    Self-attention
+        What attends to what: Tokens in one sequence attend to other tokens in the same sequence (including themselves).
+        Inputs: A single sequence provides Queries (Q), Keys (K), and Values (V) from the same hidden states.
+        Purpose: Lets the model integrate context within the sequence (e.g., words in a sentence attending to earlier/later words).
+        Cache/memory: KV cache is built from the sequence itself; for causal decoding, each new token can attend to previous tokens’ KV.
+        Typical use: Standard Transformer decoders (LLMs), encoder layers in encoder–decoder models.
+
+    Cross-attention
+        What attends to what: A “target” sequence attends to a different “source” sequence.
+        Inputs: Queries (Q) come from the target (e.g., text decoder states); Keys/Values (K,V) come from the source (e.g., image embeddings, encoder outputs, another modality).
+        Purpose: Lets the model condition one stream on another (e.g., text generation conditioned on an image or on encoder-processed text).
+        Cache/memory: The source-side KV is usually static during decoding (e.g., fixed image/token encoder outputs) and can be reused across all target time steps; it often has different size/length than the target’s KV.
+        Typical use: Encoder–decoder Transformers (machine translation), multimodal models (text attending to image/video/audio features), and VLMs with interleaved self- and cross-attention layers.
+
+Key practical implications
+
+    Direction of information flow:
+        Self-attention: within the same sequence (intra-sequence).
+        Cross-attention: from source to target (inter-sequence).
+    Shapes and sizes:
+        Self-attention: Q,K,V share the same dimension and length (up to masking).
+        Cross-attention: Q length equals target length; K,V length equals source length; their per-token embedding sizes can differ.
+    Masking:
+        Self-attention in decoders typically uses causal masks (can’t look ahead).
+        Cross-attention usually has no causal constraint over the source (target token can attend all source positions).
+    Compute/memory reuse:
+        Self-attention KV grows with target length during decoding.
+        Cross-attention KV is precomputed from the source and reused for every target step, so keeping it cached avoids recomputing the encoder.
+
+GPT-5
+60.35 tok/sec
+521 tokens
+Time-to-First: 6.3 sec
+Your message:
+
+is sliding window attention used for self or cross attention
+Assistant Reply:
+
+Sliding window attention is typically used for self-attention.
+
+    In decoder-style LLMs, sliding window self-attention limits each token to attend only to the most recent W tokens of the same sequence, reducing KV cache growth and compute.
+    Cross-attention usually attends over the entire source sequence (e.g., all image tokens or encoder outputs). Sliding-window style constraints are uncommon there because the source is fixed-length and accessed repeatedly; restricting it would risk losing important conditioning information.
+
+So, in practice: sliding window → self-attention. Cross-attention is generally full-context over the source.
+GPT-5
+33.97 tok/sec
+125 tokens
+Time-to-First: 1.6 sec
+Your message:
+
+how does jenga identify which layers should use which allocation policies?
+Attach
+Assistant Reply:
+
+Jenga doesn’t guess at runtime; it derives the layer types and their per-token state sizes from the model graph and then applies registered, type-specific policies.
+
+How it works, step by step:
+
+    Parse the model architecture
+        At engine startup, Jenga inspects the model’s modules/layers (e.g., attention blocks, cross-attention blocks, vision encoders, SSM/Mamba blocks if present).
+        For each layer type, it computes the effective KV/embedding size per token (e.g., factoring heads, dtype, compression like MQA/GQA).
+    Register custom handlers for each layer type
+        Each supported type is bound to:
+            A customized small-page allocator with a page size matching that type’s per-token state (e.g., 384 B for text self-attn KV, 256 B for image embeddings, etc.).
+            A customized evictor implementing the layer’s caching semantics via the LayerSupportsPrefixCache interface:
+                update_last_access(...) for balanced eviction
+                set_prefix_length(...) for aligned eviction
+                get_possible_prefix(...) for type-specific cache-hit logic
+    Build the compatibility layer (LCM allocator)
+        From all discovered small-page sizes, Jenga computes a single large-page size as the LCM.
+        Memory is physically partitioned into these large pages; each type’s allocator sub-partitions them into its own small pages.
+    Request-aware association
+        During allocation, Jenga tags small pages (and, by extension, their parent large pages) with the request ID to keep a request’s data co-located, improving reclamation when that request completes.
+
+How layers map to policies (examples without Mamba):
+
+    Self-attention layers
+        Allocation: small-page size = per-token KV size for that layer stack.
+        Eviction/hit: full-prefix dependency; last-access updated for all prefix tokens.
+    Sliding-window self-attention layers
+        Allocation: their own small-page size if KV differs (e.g., due to head configs).
+        Eviction/hit: only last W tokens matter; update_last_access only within window; get_possible_prefix returns prefixes whose last W tokens are present.
+    Cross-attention layers (text attending to image/video encoder outputs)
+        Allocation: separate small-page type for encoder-side KV (image tokens), typically different size from text KV.
+        Eviction/hit: treat all tokens from the same image as a group; set_prefix_length assigns the same priority within an image to evict whole images rather than scattering.
+    Vision encoders’ image embeddings (decoder-only VLMs)
+        Allocation: small-page type for image embeddings (not KV), possibly freed or overlaid after chunk consumption.
+        Eviction/hit: usually kept whole until consumed; after chunked prefill consumes an image’s embeddings, those pages can be freed or reused.
+
+Where this information comes from:
+
+    Static model introspection: module names/classes (e.g., CrossAttention vs SelfAttention), config flags (e.g., sliding window size W), head counts, head dims, precision/quantization, and whether a block is in the encoder or decoder path.
+    Engine integration: vLLM already carries per-layer metadata for attention kernels (page sizes, head geometry); Jenga leverages the same metadata to compute exact per-token sizes and to bind the right policy.
+
+If you’re integrating a new model:
+
+    Provide the model config or a small adapter that reports, for each layer block:
+        block type: self-attn (full), self-attn (sliding W), cross-attn (encoder KV), vision-embedding, etc.
+        per-token state byte size
+        dependency semantics (full-prefix, windowed, grouped-by-image, etc.)
+        Once registered, Jenga will automatically:
+    include that type’s page size in the LCM computation,
+    create the corresponding small-page allocator/evictor,
+    and apply the correct cache-hit and eviction logic at run time.
+
+GPT-5
+20.55 tok/sec
+831 tokens
+Time-to-First: 2.6 sec

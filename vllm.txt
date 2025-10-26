@@ -1,0 +1,221 @@
+T3 Chat
+New Thread
+Press Enter to send, Shift + Enter for new line
+Attach
+Your message:
+
+what are the exact contents of the kv cache, why is it able to cached instead of being recomputed each iteration?
+vllm.pdf
+Attach
+Assistant Reply:
+
+Short answer:
+
+    What’s in the KV cache: For each transformer layer and each attention head, the cache stores the “key” and “value” vectors for every past token in the sequence. Concretely, after projecting each token’s hidden state h_t through W_k and W_v, we keep k_t = W_k h_t and v_t = W_v h_t. The cache is thus a stack of tensors shaped roughly like:
+        Keys: [num_layers, num_heads, seq_len, head_dim]
+        Values: [num_layers, num_heads, seq_len, head_dim]
+        These are sometimes packed together and laid out per layer/head for efficiency.
+
+    Why it’s cached: In autoregressive decoding, at time step t you must attend to all previous positions 1..t. The attention computation needs all prior keys and values, but the keys/values for positions 1..t−1 do not change across future steps. Recomputing them at every step would repeat the same work t times. Caching them once (when first created) avoids this redundant compute, so each new step only:
+        projects the newest token’s hidden state to a single new key/value pair (k_t, v_t), appends them to the cache, and
+        computes attention for the current query q_t against the cached keys/values.
+
+Slightly more detail:
+
+    In a transformer decoder layer, self-attention at step t computes:
+        q_t = W_q h_t (just for the current token)
+        K_{1:t} = [k_1 … k_t], V_{1:t} = [v_1 … v_t] (for all past tokens)
+        scores = softmax(q_t K_{1:t}^T / sqrt(d))
+        o_t = scores · V_{1:t}
+    K and V for earlier tokens do not depend on future tokens; they are fixed once computed. Only q_t (and the newest k_t, v_t) change each step.
+    Without a KV cache, you would have to:
+        Recompute k_i, v_i for all i ≤ t at every step t, or
+        Re-run the whole prefix through all layers to regenerate the needed keys/values.
+        Both are much costlier than storing them.
+
+Practical implications:
+
+    Memory vs compute tradeoff: KV caching increases memory usage linearly with sequence length but dramatically reduces per-step compute. This turns autoregressive decoding into a “one new projection + one attention against cached tensors” per step, rather than reprocessing the entire prefix.
+    Multi-head, multi-layer: Each layer/head keeps its own K/V. That’s why the cache is large: size scales with num_layers × num_heads × seq_len × head_dim × 2 (for K and V) × bytes_per_elem.
+    Paged/blocked caches (e.g., vLLM’s PagedAttention) change how K/V are laid out in memory (non-contiguous blocks) but the semantic contents are the same: the per-layer, per-head keys and values for prior tokens.
+
+GPT-5
+77.58 tok/sec
+654 tokens
+Time-to-First: 2.3 sec
+Your message:
+
+in things like sliding window attention, is your kv cache smaller because you limit how far you attend to
+Attach
+Assistant Reply:
+
+Yes. With sliding-window (a.k.a. local) attention, the KV cache can be smaller because each step only needs keys/values from the most recent W tokens, not the entire prefix.
+
+How it works:
+
+    Standard causal self-attention at step t attends to positions 1..t, so you must keep K/V for the full prefix. Cache size grows with sequence length.
+    Sliding-window attention restricts attention to a fixed window of the last W tokens (e.g., positions max(1, t−W+1)..t). Therefore:
+        You only need to keep K/V for that window per layer/head.
+        Older K/V beyond the window can be dropped or overwritten in a ring buffer.
+        The cache size is effectively O(num_layers × num_heads × W × head_dim), independent of total sequence length once t > W.
+
+Practical notes:
+
+    This reduces memory substantially and also lowers attention compute from O(t) per step to O(W).
+    It changes model behavior: the model cannot use context older than W tokens in that layer. Some architectures mix local and global mechanisms (e.g., periodic “global” tokens, dilated windows, long-range memory layers) to retain long-context capability while keeping most layers/windowed to save memory.
+    Implementations often use a circular buffer per layer/head to store K/V of length W. On each new token:
+        Compute k_t, v_t, write into the next slot (overwriting the oldest).
+        Compute attention using only the W stored entries.
+
+So yes: limiting the attention horizon directly limits how much of the KV you need to cache at any time.
+GPT-5
+93.89 tok/sec
+344 tokens
+Time-to-First: 1.6 sec
+Your message:
+
+In the paging of vllm, the entire kv cache is needed at once, correct? if they have to evict a page, that entire sequence of generation needs to be preempted
+Attach
+Assistant Reply:
+
+Mostly correct, with two clarifications:
+
+    All-or-nothing at the sequence level: In vLLM’s design, a sequence’s attention needs all of its already-generated K/V blocks to compute the next token. Because every block for that sequence will be accessed together in the next step, vLLM adopts an all-or-nothing policy: it either keeps all blocks of a sequence in GPU memory for that step, or it preempts the sequence (evicts its blocks) and does not schedule it until the blocks are restored.
+
+    Eviction granularity is a “sequence group”: For methods like beam search or parallel sampling, vLLM gang-schedules the related sequences as a sequence group to preserve sharing (and copy-on-write) patterns. Preemption/eviction is done for the whole group together.
+
+What happens on eviction:
+
+    Swap or recompute: If GPU KV memory is tight, vLLM can evict a sequence (or group) by:
+        Swapping its KV blocks to CPU RAM, then swapping them back later, or
+        Dropping them and recomputing the KV (faster than original prefill because past tokens can be treated as a new prompt and run in one prefill pass).
+    While evicted, that sequence/group does not progress; vLLM prioritizes earlier-arrived sequences (FCFS) and resumes evicted ones when memory frees up.
+
+Why not evict only some blocks?
+
+    Access pattern: At each decoding step the attention reads all prior blocks in order. Partial eviction would still force a stall/restore for the missing blocks mid-step and complicate scheduling/sharing. Since all blocks are needed together, evicting any subset effectively blocks the whole sequence anyway—hence the simpler and efficient all-or-nothing policy.
+
+GPT-5
+68.86 tok/sec
+371 tokens
+Time-to-First: 2.0 sec
+Your message:
+
+does vllm's take into account anything about the size of a given kv cache? or is it purely about first come first serve? Isn't there some throughput inefficiency created by fcfs?
+Attach
+Assistant Reply:
+
+vLLM’s scheduler is FCFS for fairness, but it is not “blind” to KV cache size:
+
+    It tracks KV usage at block granularity
+        The KV cache manager allocates fixed-size blocks and knows how many blocks each sequence/group currently occupies and will need next step (e.g., if a new block must be allocated when the last block is full).
+        Before each iteration, vLLM selects which sequences/groups to run and allocates any new blocks required. If there aren’t enough free blocks, it preempts the most recently arrived sequences/groups (FCFS priority) and either swaps or recomputes their KV.
+
+    All-or-nothing preemption uses size implicitly
+        Because each scheduled sequence needs all its blocks present, any group that exceeds the available free blocks cannot run and will be preempted. In practice, “large” sequences (big prompts, long generations, larger block need) are more likely to be the ones that don’t fit when memory is tight, so they get deferred first, even under FCFS.
+
+    Memory-efficient layout reduces the need for size-aware heuristics
+        PagedAttention removes most internal/external fragmentation and enables sharing (prompts, beams), so effective capacity is much higher. That mitigates classic throughput losses from packing inefficiency.
+
+Throughput vs FCFS: potential inefficiencies and why vLLM still does well
+
+    FCFS can be suboptimal for pure throughput. Examples:
+        A very large sequence can block several smaller ones if memory is near capacity.
+        Heterogeneous decoding (beams vs single-sample) can have different block demands.
+    vLLM offsets this with:
+        Fine-grained iteration-level batching, so completed/short sequences quickly free blocks and new ones enter without waiting for whole batches to finish.
+        Block-level sharing and copy-on-write for prompts and beams, lowering per-request memory and increasing batch sizes.
+        Preemption at iteration boundaries, so the system can promptly reshuffle to keep the GPU busy.
+
+What vLLM does not do (by default)
+
+    It doesn’t implement a sophisticated size-aware scheduler (e.g., “shortest remaining KV” or “pack the most small sequences first”)—the paper describes FCFS fairness with all-or-nothing eviction.
+    It doesn’t partially schedule within a group (beams/parallel samples are gang-scheduled to preserve sharing).
+
+If you wanted to be even more throughput-oriented, ideas to consider
+
+    Size-aware admission: prefer admitting sets of sequences whose incremental block needs fit best (bin-packing heuristic) when memory is tight.
+    Age + size: prioritize older requests but break ties by smaller incremental block need to keep utilization high.
+    Dynamic group width: temporarily reduce beam width or parallel sample count for some groups when memory is scarce, then restore later.
+    Forecast-based eviction: pick eviction targets that minimize expected swap/recompute cost per block freed.
+
+Bottom line: vLLM’s FCFS policy is simple and fair; combined with paged KV, sharing, and iteration-level scheduling, it already achieves large throughput gains. There can be theoretical inefficiencies from FCFS under heavy heterogeneity, but the block model and preemption keep GPUs well utilized in practice.
+GPT-5
+75.04 tok/sec
+669 tokens
+Time-to-First: 1.9 sec
+Your message:
+
+how does paged attention help with external fragmentation? I can understand how it helps with internal fragmentation by adding more pages on demand
+Attach
+Assistant Reply:
+
+Great question. In vLLM, PagedAttention eliminates external fragmentation by making all KV allocations uniform-sized blocks and by decoupling a sequence’s logical layout from its physical placement.
+
+Why external fragmentation happens in prior systems
+
+    Previous systems allocate one contiguous chunk per request sized for its (predicted or max) sequence length.
+    Different requests need different chunk sizes, and chunks are freed at different times.
+    Over time, the allocator ends up with free gaps of various sizes that cannot fit the next large contiguous chunk even if total free memory would be enough. That unusable free space is external fragmentation.
+
+How PagedAttention avoids it
+
+    Fixed-size blocks only: vLLM carves the KV cache region into equal-size “physical KV blocks.” Every allocation and free is in whole blocks; there are no variable-size chunks.
+    Non-contiguous placement: A sequence’s KV cache is divided into logical blocks; each logical block can map to any free physical block. Logical adjacency does not require physical contiguity.
+    Uniform free list: Because all physical blocks are the same size, any freed block can be reused by any sequence’s next logical block. You don’t need a run of contiguous blocks to satisfy an allocation.
+
+Result
+
+    No external fragmentation arises from size mismatches or contiguity requirements. The only “waste” left is at most one partially filled block per sequence (the tail), which is internal fragmentation—and even that is bounded by the block size.
+
+Analogy to OS paging
+
+    It’s the same reason paging avoids external fragmentation in virtual memory: processes allocate/deallocate in pages of a fixed size; the OS can place pages anywhere in physical memory and remap them, so scattered free pages remain fully usable.
+
+GPT-5
+59.03 tok/sec
+358 tokens
+Time-to-First: 3.9 sec
+Your message:
+
+can kv caches not be in contiguous memory under vllm? how does address translate work?
+Attach
+Assistant Reply:
+
+Yes—under vLLM, a sequence’s KV cache does not need to live in contiguous GPU memory. That’s the core change enabled by PagedAttention.
+
+How it’s laid out
+
+    Physical KV blocks: vLLM pre-partitions a GPU-resident KV region into fixed-size blocks (all identical size).
+    Logical KV blocks: Each sequence’s KV cache is represented as an ordered list of logical blocks (filled left to right as tokens are generated).
+    Block tables: For each sequence (or sequence group), vLLM keeps a block table that maps each logical block index to a physical block ID plus a “filled slots” count for the tail block. Multiple logical blocks (even across different sequences) may point to the same physical block if sharing is allowed (with reference counts and copy-on-write when a write occurs).
+
+“Address translation” for attention
+
+    At each decoding step, the scheduler sends to the GPU workers:
+        Input token IDs for the step
+        The block table(s) for the sequences in the batch (essentially, the ordered list of physical block IDs per layer/head)
+    PagedAttention kernels use those block tables to:
+        Read keys/values: Iterate over the physical block IDs in order, fetch the block’s base address, and perform the block-level matmul/softmax against the current query.
+        Write new KV: Determine whether the last logical block still has room; if yes, write into that physical block at the next slot; otherwise, request/assign a new free physical block and append its ID to the block table.
+    GPU kernels are written to accept a list of block IDs (or pointers) rather than a single contiguous pointer+length, so they “chase” the table entry per block. To keep this efficient, vLLM:
+        Uses a compact per-sequence block table structure in device memory (or passed via control buffers).
+        Assigns a warp per block for coalesced loads/stores.
+        Fuses “read-by-table + attention” and “reshape + block write” into single kernels to avoid extra launches.
+
+Sharing and copy-on-write
+
+    Reference counts are tracked per physical block. If two sequences share a block (e.g., shared prompt), reads are shared.
+    On a write to a shared tail block, vLLM performs copy-on-write at block granularity: allocates a new physical block, copies data once with a fused “block copy” kernel, updates the writer’s block table entry, and decrements the old block’s refcount.
+
+Preemption/eviction
+
+    Because all state is in blocks and tables, eviction doesn’t require contiguity either:
+        Swap: copy the referenced physical blocks to CPU RAM (a second block pool) and mark the table as swapped.
+        Recomputation: drop the blocks and later rebuild them in one prefill pass, then rebuild the block table.
+
+In short: KV caches are intentionally non-contiguous in vLLM. The “address translation” is the per-sequence block table that maps logical block indices to physical block IDs, which the PagedAttention kernels consult to read/write KV in block order, just like virtual memory page tables enable non-contiguous physical placement.
+GPT-5
+45.05 tok/sec
+669 tokens
+Time-to-First: 3.1 sec
